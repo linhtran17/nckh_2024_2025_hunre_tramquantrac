@@ -125,7 +125,7 @@ nckh_2024_2025_hunre_tramquantrac/
 ---
 
 ## 👨‍💻 Người thực hiện
-- **Trần Thị Linh** – Lead Software Developer (Backend, Web, Mobile)
+- **Trần Thị Linh** 
 - Cùng các thành viên nhóm hỗ trợ phần cứng & triển khai thực tế.
 
 ---
