@@ -1,0 +1,279 @@
+/***********************
+ *  ESP32 WEATHER NODE
+ *  - DHT22: nhiệt độ/độ ẩm (PIN_DHT)
+ *  - Tipping bucket (mưa) qua Hall: PIN_HALL_RAIN (interrupt)
+ *  - Anemometer (gió) qua Hall: PIN_HALL_WIND (interrupt)
+ *  - Rain detector MH-RD (digital): PIN_RAIN_DETECTOR (lọc nhiễu)
+ *  - Gửi HTTP POST (JSON mảng) tới /api/weather
+ ***********************/
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <DHT.h>
+#include <math.h>  // dùng fabsf
+
+/********** WiFi & Server **********/
+const char* ssid      = "realme 9";
+const char* password  = "12345689999"; // <-- kiểm tra lại cho đúng
+const char* serverUrl = "http://10.140.6.159:3005/api/weather"; // <-- IP server Node
+const int   stationId = 6;
+
+/********** Cảm biến **********/
+#define PIN_DHT 4
+#define DHTTYPE DHT22
+DHT dht(PIN_DHT, DHTTYPE);
+
+// Hall sensors & rain detector
+#define PIN_HALL_RAIN     16
+#define PIN_HALL_WIND     14
+#define PIN_RAIN_DETECTOR 17
+
+/********** Hằng số hiệu chuẩn **********/
+const float rainPerTip_mm       = 2.73f;  // mm mỗi nhấp tipping bucket
+const float windCircumference_m = 0.628f; // m/ vòng quay cốc gió (tuỳ cảm biến)
+
+/********** Biến toàn cục **********/
+volatile unsigned long rainCount = 0; // tổng số nhấp mưa từ lúc bật
+volatile unsigned long windCount = 0; // tổng số vòng gió từ lúc bật
+
+// snapshots để tính delta theo khoảng thời gian
+unsigned long rainCountPrev5s = 0;
+unsigned long windCountPrev5s = 0;
+unsigned long rainCountPrev5m = 0;
+unsigned long windCountPrev5m = 0;
+
+// nhớ giá trị lần cuối đã gửi (để chống spam)
+float lastTemperature = -999.0f;
+float lastHumidity    = -999.0f;
+float lastRainAmount  = -1.0f;
+float lastWindSpeed   = -1.0f;
+
+// thời gian
+unsigned long last5sTime = 0;
+unsigned long last5mTime = 0;
+const unsigned long INTERVAL_5S = 5000;          // mỗi 5 giây
+const unsigned long INTERVAL_5M = 5UL * 60 * 1000; // mỗi 5 phút
+
+/********** Utilities **********/
+bool readRainSensor() {
+  // Lọc nhiễu cho MH-RD (LOW = có nước)
+  const int numReadings = 5;
+  int lowCount = 0;
+  for (int i = 0; i < numReadings; i++) {
+    if (digitalRead(PIN_RAIN_DETECTOR) == LOW) lowCount++;
+    delay(10);
+  }
+  return (lowCount >= numReadings / 2);
+}
+
+void ensureWiFiConnected() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  Serial.println("WiFi mất kết nối, đang thử lại...");
+  WiFi.disconnect();
+  WiFi.begin(ssid, password);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(1000);
+    Serial.print(".");
+    attempts++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi connected!");
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n❌ Không thể kết nối WiFi!");
+  }
+}
+
+/********** Interrupt Service Routines **********/
+void IRAM_ATTR onRainTip() {
+  static unsigned long lastT = 0;
+  unsigned long now = millis();
+  if (now - lastT > 500) { // chống bounce
+    rainCount++;
+    lastT = now;
+  }
+}
+
+void IRAM_ATTR onWindSpin() {
+  static unsigned long lastT = 0;
+  unsigned long now = millis();
+  if (now - lastT > 200) { // chống bounce (gió quay nhanh hơn mưa, giảm debounce)
+    windCount++;
+    lastT = now;
+  }
+}
+
+/********** Gửi dữ liệu **********/
+void sendBatchToServer(float t, float h, float rain, float wind) {
+  ensureWiFiConnected();
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠️ Bỏ qua gửi vì WiFi chưa kết nối");
+    return;
+  }
+
+  // thay thế NAN bằng last known để tránh gửi NaN
+  if (isnan(t)) {
+    Serial.println("Lỗi đọc nhiệt độ, dùng giá trị trước.");
+    t = lastTemperature;
+  }
+  if (isnan(h)) {
+    Serial.println("Lỗi đọc độ ẩm, dùng giá trị trước.");
+    h = lastHumidity;
+  }
+  if (rain < 0) rain = 0;
+  if (wind < 0) wind = 0;
+
+  // Ngưỡng thay đổi để tránh spam
+  bool firstSend = (lastTemperature == -999.0f || lastHumidity == -999.0f || lastRainAmount < 0 || lastWindSpeed < 0);
+  bool changed =
+    firstSend ||
+    fabsf(t - lastTemperature) > 0.5f ||
+    fabsf(h - lastHumidity)    > 1.0f ||
+    fabsf(rain - lastRainAmount) > 0.1f ||
+    fabsf(wind - lastWindSpeed)  > 0.1f;
+
+  if (!changed) {
+    Serial.println("⏭️ Dữ liệu không thay đổi đáng kể → không gửi.");
+    return;
+  }
+
+  HTTPClient http;
+  http.begin(serverUrl);
+  http.addHeader("Content-Type", "application/json");
+
+  // JSON mảng gồm 4 object
+  StaticJsonDocument<512> doc;
+  JsonArray arr = doc.to<JsonArray>();
+
+  JsonObject o1 = arr.createNestedObject();
+  o1["station_id"]     = stationId;
+  o1["parameter_type"] = "temperature";
+  o1["value"]          = roundf(t * 100) / 100.0f;
+
+  JsonObject o2 = arr.createNestedObject();
+  o2["station_id"]     = stationId;
+  o2["parameter_type"] = "humidity";
+  o2["value"]          = roundf(h * 100) / 100.0f;
+
+  JsonObject o3 = arr.createNestedObject();
+  o3["station_id"]     = stationId;
+  o3["parameter_type"] = "rainfall";
+  o3["value"]          = roundf(rain * 100) / 100.0f;
+
+  JsonObject o4 = arr.createNestedObject();
+  o4["station_id"]     = stationId;
+  o4["parameter_type"] = "wind";
+  o4["value"]          = roundf(wind * 100) / 100.0f;
+
+  String body;
+  serializeJson(doc, body);
+  Serial.println("📤 POST " + String(serverUrl));
+  Serial.println("Payload: " + body);
+
+  int code = http.POST(body);
+  if (code > 0) {
+    Serial.printf("✅ Server responded: %d\n", code);
+    String resp = http.getString();
+    Serial.println("Resp: " + resp);
+    // cập nhật last*
+    lastTemperature = t;
+    lastHumidity    = h;
+    lastRainAmount  = rain;
+    lastWindSpeed   = wind;
+  } else {
+    Serial.printf("❌ POST failed: %s\n", http.errorToString(code).c_str());
+  }
+  http.end();
+}
+
+/********** Setup **********/
+void setup() {
+  Serial.begin(115200);
+
+  // WiFi
+  Serial.print("Kết nối WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi connected!");
+  Serial.print("IP: "); Serial.println(WiFi.localIP());
+
+  // Sensors
+  dht.begin();
+  pinMode(PIN_RAIN_DETECTOR, INPUT);
+  pinMode(PIN_HALL_RAIN, INPUT_PULLUP);
+  pinMode(PIN_HALL_WIND, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(PIN_HALL_RAIN), onRainTip, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_HALL_WIND), onWindSpin, FALLING);
+
+  last5sTime = millis();
+  last5mTime = millis();
+}
+
+/********** Loop **********/
+void loop() {
+  unsigned long now = millis();
+
+  // --- Mỗi 5 giây: đọc và gửi tức thời ---
+  if (now - last5sTime >= INTERVAL_5S) {
+    // đọc DHT
+    float t = dht.readTemperature(); // °C
+    float h = dht.readHumidity();    // %
+
+    bool raining = readRainSensor();
+
+    // chụp số đếm hiện tại (tránh race)
+    noInterrupts();
+    unsigned long rNow = rainCount;
+    unsigned long wNow = windCount;
+    interrupts();
+
+    // delta 5s
+    unsigned long dRain5s = (rNow >= rainCountPrev5s) ? (rNow - rainCountPrev5s) : 0;
+    unsigned long dWind5s = (wNow >= windCountPrev5s) ? (wNow - windCountPrev5s) : 0;
+
+    // lượng mưa trong 5s (nếu cảm biến báo có mưa)
+    float rain5s = raining ? (dRain5s * rainPerTip_mm) : 0.0f;
+
+    // tốc độ gió tức thời (m/s) = quãng đường (m) / thời gian (s)
+    float wind5s = (dWind5s * windCircumference_m) / (INTERVAL_5S / 1000.0f);
+
+    // log
+    Serial.printf("🌡 %.2f °C | 💧 %.2f %% | ☔ %.2f mm/5s | 🍃 %.2f m/s\n",
+                  t, h, rain5s, wind5s);
+
+    // gửi
+    sendBatchToServer(t, h, rain5s, wind5s);
+
+    // cập nhật snapshot
+    rainCountPrev5s = rNow;
+    windCountPrev5s = wNow;
+    last5sTime = now;
+  }
+
+  // --- Mỗi 5 phút: tổng hợp (tuỳ bạn dùng hiển thị/ghi log) ---
+  if (now - last5mTime >= INTERVAL_5M) {
+    noInterrupts();
+    unsigned long rNow = rainCount;
+    unsigned long wNow = windCount;
+    interrupts();
+
+    unsigned long dRain5m = (rNow >= rainCountPrev5m) ? (rNow - rainCountPrev5m) : 0;
+    unsigned long dWind5m = (wNow >= windCountPrev5m) ? (wNow - windCountPrev5m) : 0;
+
+    float rain5mTotal = dRain5m * rainPerTip_mm; // mm/5 phút
+    float wind5mAvg   = (dWind5m * windCircumference_m) / (INTERVAL_5M / 1000.0f); // m/s trung bình
+
+    Serial.printf("⏱️ 5m total: ☔ %.2f mm | 🍃 avg %.2f m/s\n", rain5mTotal, wind5mAvg);
+
+    // (không bắt buộc gửi lần nữa để tránh spam — tuỳ nhu cầu)
+    // sendBatchToServer(lastTemperature, lastHumidity, rain5mTotal, wind5mAvg);
+
+    rainCountPrev5m = rNow;
+    windCountPrev5m = wNow;
+    last5mTime = now;
+  }
+}
